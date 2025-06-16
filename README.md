@@ -33,19 +33,24 @@ FC온라인 선수들의 능력치, 시즌, 포지션, 팀컬러, 강화, 가격
 ### 🎯 고급 검색 필터 기능
 - 다양한 스탯, 시즌, 팀컬러, 급여 조건을 동시에 조합 가능
 
-![search_1](.github/images/f1.png)  
+![search_1](.github/images/f1.png) 
+
 ![search_2](.github/images/f2.png)  
+
 ![search_3](.github/images/f3.png)
 
 ### 🎯 실전처럼 조합된 필터 예시
 - 다양한 스탯, 시즌, 팀컬러, 급여 조건을 동시에 조합 가능
 
 ![search_1](.github/images/wf1.png)  
-![search_2](.github/images/wf2.png)  
+
+![search_2](.github/images/wf2.png) 
+
 ![search_3](.github/images/wf3.png)
 
 ### 📋 고급 검색 결과 창
 - 필터에 맞는 검색결과를 보여줍니다
+
 ![search_3](.github/images/ws1.png)
 
 ---
