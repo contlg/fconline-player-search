@@ -53,10 +53,10 @@ python 피온탐색기V2-1.py
 ```
 fconline-player-search/
 │
-├── 피온탐색기py            # 메인 실행 파일
-├── FCDataMaker.py         # 데이터 수집 스크립트
-├── README.md              # 이 설명서
-├──requirements.txt        # 패키지 리스트
+├── 피온탐색기py             # 메인 실행 파일
+├── FCDataMaker.py          # 데이터 수집 스크립트
+├── README.md               # 이 설명서
+├── requirements.txt        # 패키지 리스트
 
 ├── data/
 │   └── details.csv        # 선수 스탯 정보
