@@ -77,7 +77,7 @@ fconline-player-search/
 
 - **김태영**  
 - GitHub: [@contlg](https://github.com/contlg)
-  ### 연락처
+-  연락처
   -ty2004107@naver.com
 
 ---
