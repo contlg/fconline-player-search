@@ -435,17 +435,11 @@ def _mp_worker_entry(
     stop_val: mp.Value,
     done_val: mp.Value,
 ) -> None:
-    """fork 방식 워커 진입점. 부모 이벤트루프 상태 초기화 후 새 루프 생성."""
-    asyncio.set_event_loop(None)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(_mp_worker_async(
-            job_chunk, tmp_csv, worker_id, max_con,
-            set(done_codes_list), stop_val, done_val,
-        ))
-    finally:
-        loop.close()
+    """fork 워커 진입점. 부모가 asyncio 없는 상태에서 fork하므로 깨끗한 루프 생성."""
+    asyncio.run(_mp_worker_async(
+        job_chunk, tmp_csv, worker_id, max_con,
+        set(done_codes_list), stop_val, done_val,
+    ))
 
 
 async def _mp_worker_async(
@@ -528,7 +522,6 @@ async def run_phase2(
     max_con: int,
     stop_event: threading.Event,
     progress_cb,
-    n_workers: int = 1,
 ) -> None:
     """
     단일 세션 스트리밍 파이프라인.
@@ -552,75 +545,6 @@ async def run_phase2(
         print("⚠️ 수집할 job이 없습니다.")
         return
 
-    # ── 멀티프로세스 경로 ─────────────────────────────────
-    if n_workers > 1:
-        print(f"=== [Phase 2] 멀티프로세스 수집 ({n_workers}프로세스) ===")
-        print(f"  job 수: {total_jobs}, max_con/프로세스: {max_con}, 총 동시: {max_con * n_workers}")
-        print(f"  이미 완료: {len(done_codes)}명 스킵")
-
-        chunks: list[list] = [[] for _ in range(n_workers)]
-        for i, job in enumerate(all_jobs):
-            chunks[i % n_workers].append(job)
-
-        tmp_csvs = [DETAILS_CSV + f".proc{i}.tmp" for i in range(n_workers)]
-
-        ctx      = mp.get_context("fork")
-        stop_val = ctx.Value("b", 0)
-        done_val = ctx.Value("i", 0)
-
-        def _stop_bridge() -> None:
-            stop_event.wait()
-            stop_val.value = 1
-        threading.Thread(target=_stop_bridge, daemon=True).start()
-
-        done_codes_list = list(done_codes)
-        processes = [
-            ctx.Process(
-                target=_mp_worker_entry,
-                args=(chunks[i], tmp_csvs[i], i, max_con,
-                      done_codes_list, stop_val, done_val),
-                daemon=True,
-            )
-            for i in range(n_workers)
-        ]
-        for p in processes:
-            p.start()
-        print(f"  {n_workers}개 워커 프로세스 시작")
-
-        while any(p.is_alive() for p in processes):
-            progress_cb(done_val.value, total_jobs)
-            await asyncio.sleep(1.0)
-        for p in processes:
-            p.join(timeout=30)
-
-        all_dfs: list = []
-        if os.path.exists(DETAILS_CSV):
-            try:
-                all_dfs.append(pd.read_csv(DETAILS_CSV, on_bad_lines="skip"))
-            except Exception:
-                pass
-        for tmp_csv in tmp_csvs:
-            if os.path.exists(tmp_csv):
-                try:
-                    df = pd.read_csv(tmp_csv, on_bad_lines="skip")
-                    if not df.empty:
-                        all_dfs.append(df)
-                except Exception as e:
-                    print(f"⚠️ 워커 CSV 읽기 실패: {e}")
-                finally:
-                    if os.path.exists(tmp_csv):
-                        os.remove(tmp_csv)
-
-        if all_dfs:
-            merged = (pd.concat(all_dfs, ignore_index=True)
-                        .drop_duplicates(subset=["player_code"]))
-            atomic_write_csv(merged, DETAILS_CSV, index=False, encoding="utf-8-sig")
-            print(f"✅ Phase 2 완료 — 총 {len(merged)}명 수집")
-        else:
-            print("⚠️ 수집된 데이터 없음")
-        return
-
-    # ── 단일프로세스 경로 (기존) ──────────────────────────
     print(f"=== [Phase 2] 스트리밍 수집 시작 ===")
     print(f"  job 수: {total_jobs}, max_con: {max_con}")
     print(f"  이미 완료: {len(done_codes)}명 스킵")
@@ -671,43 +595,140 @@ async def run_phase2(
     print(f"✅ Phase 2 완료 — 총 {len(done_codes)}명 수집")
 
 
-async def run_pipeline_async(
+def _run_phase2_sync(
+    ovr_results: dict,
+    salary_range: range,
+    max_con: int,
+    n_workers: int,
+    stop_event: threading.Event,
+    progress_cb,
+) -> None:
+    """
+    멀티프로세스 Phase 2 (동기 실행).
+    asyncio 이벤트루프가 닫힌 상태에서 호출해야 fork가 안전.
+    각 워커는 독립 asyncio 루프로 실행.
+    """
+    done_codes = load_done_codes()
+    all_jobs   = generate_all_jobs(ovr_results, salary_range)
+    total_jobs = len(all_jobs)
+
+    if not all_jobs:
+        print("⚠️ 수집할 job이 없습니다.")
+        return
+
+    print(f"=== [Phase 2] 멀티프로세스 수집 ({n_workers}프로세스) ===")
+    print(f"  job 수: {total_jobs}, max_con/프로세스: {max_con}, 총 동시: {max_con * n_workers}")
+    print(f"  이미 완료: {len(done_codes)}명 스킵")
+
+    chunks: list = [[] for _ in range(n_workers)]
+    for i, job in enumerate(all_jobs):
+        chunks[i % n_workers].append(job)
+
+    tmp_csvs = [DETAILS_CSV + f".proc{i}.tmp" for i in range(n_workers)]
+
+    # fork: asyncio 루프 없는 상태이므로 epoll 충돌 없음
+    ctx      = mp.get_context("fork")
+    stop_val = ctx.Value("b", 0)
+    done_val = ctx.Value("i", 0)
+
+    def _stop_bridge() -> None:
+        stop_event.wait()
+        stop_val.value = 1
+    threading.Thread(target=_stop_bridge, daemon=True).start()
+
+    done_codes_list = list(done_codes)
+    processes = [
+        ctx.Process(
+            target=_mp_worker_entry,
+            args=(chunks[i], tmp_csvs[i], i, max_con,
+                  done_codes_list, stop_val, done_val),
+            daemon=True,
+        )
+        for i in range(n_workers)
+    ]
+    for p in processes:
+        p.start()
+    print(f"  {n_workers}개 워커 프로세스 시작")
+
+    while any(p.is_alive() for p in processes):
+        progress_cb(done_val.value, total_jobs)
+        time.sleep(0.5)
+    for p in processes:
+        p.join(timeout=30)
+
+    all_dfs: list = []
+    if os.path.exists(DETAILS_CSV):
+        try:
+            all_dfs.append(pd.read_csv(DETAILS_CSV, on_bad_lines="skip"))
+        except Exception:
+            pass
+    for tmp_csv in tmp_csvs:
+        if os.path.exists(tmp_csv):
+            try:
+                df = pd.read_csv(tmp_csv, on_bad_lines="skip")
+                if not df.empty:
+                    all_dfs.append(df)
+            except Exception as e:
+                print(f"⚠️ 워커 CSV 읽기 실패: {e}")
+            finally:
+                if os.path.exists(tmp_csv):
+                    os.remove(tmp_csv)
+
+    if all_dfs:
+        merged = (pd.concat(all_dfs, ignore_index=True)
+                    .drop_duplicates(subset=["player_code"]))
+        atomic_write_csv(merged, DETAILS_CSV, index=False, encoding="utf-8-sig")
+        print(f"✅ Phase 2 완료 — 총 {len(merged)}명 수집")
+    else:
+        print("⚠️ 수집된 데이터 없음")
+
+
+def run_pipeline(
     salary_range: range,
     max_con: int,
     n_workers: int,
     stop_event: threading.Event,
     gui_queue: queue.Queue,
 ) -> None:
-
+    """
+    메인 파이프라인 (동기, 워커 스레드에서 실행).
+    Phase 1: asyncio.run() → 루프 완전 종료
+    Phase 2: n_workers>1 시 루프 없는 상태에서 fork → 안전
+    """
     def progress_cb(done: int, total: int) -> None:
         gui_queue.put(("progress", done, total))
 
     t0 = time.time()
 
-    ovr_results = await run_phase1(
-        salary_range, max_con, stop_event,
-        lambda d, t: (progress_cb(d, t), None)[1],
+    # ── Phase 1 ─────────────────────────────────────────────
+    ovr_results = asyncio.run(
+        run_phase1(salary_range, max_con, stop_event,
+                   lambda d, t: (progress_cb(d, t), None)[1])
     )
     if stop_event.is_set():
+        gui_queue.put(("done", False))
         return
 
     save_checkpoint({"ovr_results": ovr_results})
 
-    await run_phase2(
-        ovr_results, salary_range, max_con, stop_event,
-        lambda d, t: (progress_cb(d, t), None)[1],
-        n_workers=n_workers,
-    )
+    # ── Phase 2 ─────────────────────────────────────────────
+    # asyncio.run()이 완전히 종료된 후 실행 → fork 안전
+    if n_workers > 1:
+        _run_phase2_sync(ovr_results, salary_range, max_con,
+                         n_workers, stop_event, progress_cb)
+    else:
+        asyncio.run(
+            run_phase2(ovr_results, salary_range, max_con, stop_event,
+                       lambda d, t: (progress_cb(d, t), None)[1])
+        )
+
     if stop_event.is_set():
+        gui_queue.put(("done", False))
         return
 
     finalize()
     print(f"\n✨ 총 소요 시간: {time.time() - t0:.1f}초 ✨")
     gui_queue.put(("done", True))
-
-
-def run_pipeline(salary_range, max_con, n_workers, stop_event, gui_queue):
-    asyncio.run(run_pipeline_async(salary_range, max_con, n_workers, stop_event, gui_queue))
 
 
 # ══════════════════════════════════════════════════════════

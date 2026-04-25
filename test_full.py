@@ -1,8 +1,9 @@
 """
 salary 5~50 전체 수집 테스트. v1 기준 41,289명 초과 확인용.
+멀티프로세스 테스트: n_workers=2, max_con=100
 """
 import asyncio, threading, time, json, os, sys, types
-import aiohttp, pandas as pd
+import pandas as pd
 
 for mod in ["tkinter","tkinter.ttk","tkinter.scrolledtext","tkinter.messagebox"]:
     if mod not in sys.modules:
@@ -21,24 +22,31 @@ v2.DETAILS_CSV     = os.path.join(v2.DATA_DIR, "details_full_test.csv")
 v2.FINAL_CSV       = os.path.join(v2.DATA_DIR, "all_player_detail_full_test.csv")
 v2.CHECKPOINT_JSON = os.path.join(v2.DATA_DIR, "checkpoint_full_test.json")
 
-async def main():
+if __name__ == "__main__":
     stop_event   = threading.Event()
-    salary_range = range(50, 4, -1)   # salary 5~50
+    salary_range = range(50, 4, -1)
+    MAX_CON      = 100
+    N_WORKERS    = 2
+    gui_queue    = __import__("queue").Queue()
 
     t0 = time.time()
-    print("Phase 1: OVR 탐색 (salary 5~50)")
-    ovr_results = await v2.run_phase1(salary_range, max_con=50,
-                                      stop_event=stop_event,
-                                      progress_cb=lambda d,t: None)
-    print(f"OVR 결과: {json.dumps({k: ovr_results[k] for k in sorted(ovr_results.keys(), key=int) if ovr_results[k]}, ensure_ascii=False)}")
+    print(f"Phase 1: OVR 탐색 (salary 5~50)")
+    ovr_results = asyncio.run(
+        v2.run_phase1(salary_range, max_con=MAX_CON,
+                      stop_event=stop_event,
+                      progress_cb=lambda d, t: None)
+    )
+    print(f"OVR 탐색 완료: {len(ovr_results)}개 급여")
     print(f"Phase 1: {time.time()-t0:.1f}초\n")
 
-    print("Phase 2: 수집 시작")
+    print(f"Phase 2: 멀티프로세스 수집 (n_workers={N_WORKERS}, max_con={MAX_CON})")
     t1 = time.time()
-    await v2.run_phase2(ovr_results, salary_range, max_con=100,
-                        n_workers=2,
-                        stop_event=stop_event,
-                        progress_cb=lambda d,t: None)
+    v2._run_phase2_sync(
+        ovr_results, salary_range,
+        max_con=MAX_CON, n_workers=N_WORKERS,
+        stop_event=stop_event,
+        progress_cb=lambda d, t: None,
+    )
     print(f"Phase 2: {time.time()-t1:.1f}초\n")
 
     v2.finalize()
@@ -69,8 +77,6 @@ async def main():
     print(f"중복 player_code: {dupes}개")
     print(f"총 소요: {time.time()-t0:.1f}초")
 
-asyncio.run(main())
-
-for f in [v2.DETAILS_CSV, v2.FINAL_CSV, v2.CHECKPOINT_JSON]:
-    if os.path.exists(f): os.remove(f)
-print("테스트 파일 정리 완료")
+    for f in [v2.DETAILS_CSV, v2.FINAL_CSV, v2.CHECKPOINT_JSON]:
+        if os.path.exists(f): os.remove(f)
+    print("테스트 파일 정리 완료")
