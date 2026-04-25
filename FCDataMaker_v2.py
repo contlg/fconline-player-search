@@ -435,11 +435,17 @@ def _mp_worker_entry(
     stop_val: mp.Value,
     done_val: mp.Value,
 ) -> None:
-    """Picklable top-level entry point for subprocess (spawn)."""
-    asyncio.run(_mp_worker_async(
-        job_chunk, tmp_csv, worker_id, max_con,
-        set(done_codes_list), stop_val, done_val,
-    ))
+    """fork 방식 워커 진입점. 부모 이벤트루프 상태 초기화 후 새 루프 생성."""
+    asyncio.set_event_loop(None)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_mp_worker_async(
+            job_chunk, tmp_csv, worker_id, max_con,
+            set(done_codes_list), stop_val, done_val,
+        ))
+    finally:
+        loop.close()
 
 
 async def _mp_worker_async(
@@ -558,7 +564,7 @@ async def run_phase2(
 
         tmp_csvs = [DETAILS_CSV + f".proc{i}.tmp" for i in range(n_workers)]
 
-        ctx      = mp.get_context("spawn")
+        ctx      = mp.get_context("fork")
         stop_val = ctx.Value("b", 0)
         done_val = ctx.Value("i", 0)
 
