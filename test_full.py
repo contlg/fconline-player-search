@@ -27,7 +27,7 @@ async def main():
 
     t0 = time.time()
     print("Phase 1: OVR 탐색 (salary 5~50)")
-    ovr_results = await v2.run_phase1(salary_range, max_con=100,
+    ovr_results = await v2.run_phase1(salary_range, max_con=50,
                                       stop_event=stop_event,
                                       progress_cb=lambda d,t: None)
     print(f"OVR 결과: {json.dumps({k: ovr_results[k] for k in sorted(ovr_results.keys(), key=int) if ovr_results[k]}, ensure_ascii=False)}")
@@ -35,8 +35,8 @@ async def main():
 
     print("Phase 2: 수집 시작")
     t1 = time.time()
-    await v2.run_phase2(ovr_results, salary_range, max_con=100,
-                        n_workers=4,
+    await v2.run_phase2(ovr_results, salary_range, max_con=50,
+                        n_workers=2,
                         stop_event=stop_event,
                         progress_cb=lambda d,t: None)
     print(f"Phase 2: {time.time()-t1:.1f}초\n")
