@@ -1,7 +1,20 @@
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from __future__ import annotations
+try:
+    import tkinter as tk
+    from tkinter import ttk, scrolledtext, messagebox
+    _HAS_TKINTER = True
+except Exception:
+    import types as _types
+    tk = _types.SimpleNamespace(Tk=object, Toplevel=object, Frame=object,
+                                 StringVar=object, DoubleVar=object)
+    ttk = _types.SimpleNamespace(Style=object, Label=object, Button=object,
+                                  Entry=object, Frame=object, Progressbar=object)
+    scrolledtext = _types.SimpleNamespace(ScrolledText=object)
+    messagebox   = _types.SimpleNamespace()
+    _HAS_TKINTER = False
+
 import threading, queue, sys, io, time, json, re
-import os, asyncio, aiohttp
+import os, asyncio, aiohttp, multiprocessing as mp
 import pandas as pd
 from bs4 import BeautifulSoup
 from dataclasses import dataclass
@@ -402,6 +415,92 @@ def flush_buffer(buf: list, write_lock_dummy=None) -> None:
         os.replace(tmp, DETAILS_CSV)
 
 
+def _flush_to_path(buf: list, path: str) -> None:
+    """워커 전용 tmp CSV에 버퍼 추가 저장."""
+    if not buf:
+        return
+    df_new = pd.DataFrame(buf)
+    if os.path.exists(path):
+        df_new.to_csv(path, mode="a", index=False, header=False, encoding="utf-8-sig")
+    else:
+        df_new.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def _mp_worker_entry(
+    job_chunk: list,
+    tmp_csv: str,
+    worker_id: int,
+    max_con: int,
+    done_codes_list: list,
+    stop_val: mp.Value,
+    done_val: mp.Value,
+) -> None:
+    """Picklable top-level entry point for subprocess (spawn)."""
+    asyncio.run(_mp_worker_async(
+        job_chunk, tmp_csv, worker_id, max_con,
+        set(done_codes_list), stop_val, done_val,
+    ))
+
+
+async def _mp_worker_async(
+    job_chunk: list,
+    tmp_csv: str,
+    worker_id: int,
+    max_con: int,
+    done_codes: set,
+    stop_val: mp.Value,
+    done_val: mp.Value,
+) -> None:
+    queued_codes: set[str] = set(done_codes)
+    q_lock   = asyncio.Lock()
+    buf_lock = asyncio.Lock()
+    buffer:  list = []
+
+    code_con   = max(5, max_con // 5)
+    detail_con = max_con
+
+    async with aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(limit=detail_con + code_con)
+    ) as session:
+        code_sem   = asyncio.Semaphore(code_con)
+        detail_sem = asyncio.Semaphore(detail_con)
+        pending: set = set()
+
+        async def fetch_and_save(code: str) -> None:
+            detail = await fetch_detail_for_code(session, detail_sem, code)
+            if detail:
+                async with buf_lock:
+                    buffer.append(detail)
+                    if len(buffer) >= 50:
+                        _flush_to_path(buffer[:], tmp_csv)
+                        buffer.clear()
+                        with done_val.get_lock():
+                            done_val.value += 50
+
+        async def process_job(job: dict) -> None:
+            if stop_val.value:
+                return
+            codes = await fetch_codes_for_job(session, code_sem, job)
+            async with q_lock:
+                new_codes = [c for c in codes if c not in queued_codes]
+                queued_codes.update(new_codes)
+            for code in new_codes:
+                t = asyncio.create_task(fetch_and_save(code))
+                pending.add(t)
+                t.add_done_callback(pending.discard)
+
+        await asyncio.gather(*[process_job(j) for j in job_chunk])
+        if pending:
+            await asyncio.gather(*list(pending), return_exceptions=True)
+        async with buf_lock:
+            if buffer:
+                _flush_to_path(buffer[:], tmp_csv)
+                with done_val.get_lock():
+                    done_val.value += len(buffer)
+
+    print(f"  [W{worker_id}] 완료")
+
+
 def finalize() -> None:
     """details.csv → all_player_detail.csv 최종 출력 (Bug 1 수정)."""
     if not os.path.exists(DETAILS_CSV):
@@ -423,6 +522,7 @@ async def run_phase2(
     max_con: int,
     stop_event: threading.Event,
     progress_cb,
+    n_workers: int = 1,
 ) -> None:
     """
     단일 세션 스트리밍 파이프라인.
@@ -446,6 +546,75 @@ async def run_phase2(
         print("⚠️ 수집할 job이 없습니다.")
         return
 
+    # ── 멀티프로세스 경로 ─────────────────────────────────
+    if n_workers > 1:
+        print(f"=== [Phase 2] 멀티프로세스 수집 ({n_workers}프로세스) ===")
+        print(f"  job 수: {total_jobs}, max_con/프로세스: {max_con}, 총 동시: {max_con * n_workers}")
+        print(f"  이미 완료: {len(done_codes)}명 스킵")
+
+        chunks: list[list] = [[] for _ in range(n_workers)]
+        for i, job in enumerate(all_jobs):
+            chunks[i % n_workers].append(job)
+
+        tmp_csvs = [DETAILS_CSV + f".proc{i}.tmp" for i in range(n_workers)]
+
+        ctx      = mp.get_context("spawn")
+        stop_val = ctx.Value("b", 0)
+        done_val = ctx.Value("i", 0)
+
+        def _stop_bridge() -> None:
+            stop_event.wait()
+            stop_val.value = 1
+        threading.Thread(target=_stop_bridge, daemon=True).start()
+
+        done_codes_list = list(done_codes)
+        processes = [
+            ctx.Process(
+                target=_mp_worker_entry,
+                args=(chunks[i], tmp_csvs[i], i, max_con,
+                      done_codes_list, stop_val, done_val),
+                daemon=True,
+            )
+            for i in range(n_workers)
+        ]
+        for p in processes:
+            p.start()
+        print(f"  {n_workers}개 워커 프로세스 시작")
+
+        while any(p.is_alive() for p in processes):
+            progress_cb(done_val.value, total_jobs)
+            await asyncio.sleep(1.0)
+        for p in processes:
+            p.join(timeout=30)
+
+        all_dfs: list = []
+        if os.path.exists(DETAILS_CSV):
+            try:
+                all_dfs.append(pd.read_csv(DETAILS_CSV, on_bad_lines="skip"))
+            except Exception:
+                pass
+        for tmp_csv in tmp_csvs:
+            if os.path.exists(tmp_csv):
+                try:
+                    df = pd.read_csv(tmp_csv, on_bad_lines="skip")
+                    if not df.empty:
+                        all_dfs.append(df)
+                except Exception as e:
+                    print(f"⚠️ 워커 CSV 읽기 실패: {e}")
+                finally:
+                    if os.path.exists(tmp_csv):
+                        os.remove(tmp_csv)
+
+        if all_dfs:
+            merged = (pd.concat(all_dfs, ignore_index=True)
+                        .drop_duplicates(subset=["player_code"]))
+            atomic_write_csv(merged, DETAILS_CSV, index=False, encoding="utf-8-sig")
+            print(f"✅ Phase 2 완료 — 총 {len(merged)}명 수집")
+        else:
+            print("⚠️ 수집된 데이터 없음")
+        return
+
+    # ── 단일프로세스 경로 (기존) ──────────────────────────
     print(f"=== [Phase 2] 스트리밍 수집 시작 ===")
     print(f"  job 수: {total_jobs}, max_con: {max_con}")
     print(f"  이미 완료: {len(done_codes)}명 스킵")
@@ -499,6 +668,7 @@ async def run_phase2(
 async def run_pipeline_async(
     salary_range: range,
     max_con: int,
+    n_workers: int,
     stop_event: threading.Event,
     gui_queue: queue.Queue,
 ) -> None:
@@ -520,6 +690,7 @@ async def run_pipeline_async(
     await run_phase2(
         ovr_results, salary_range, max_con, stop_event,
         lambda d, t: (progress_cb(d, t), None)[1],
+        n_workers=n_workers,
     )
     if stop_event.is_set():
         return
@@ -529,8 +700,8 @@ async def run_pipeline_async(
     gui_queue.put(("done", True))
 
 
-def run_pipeline(salary_range, max_con, stop_event, gui_queue):
-    asyncio.run(run_pipeline_async(salary_range, max_con, stop_event, gui_queue))
+def run_pipeline(salary_range, max_con, n_workers, stop_event, gui_queue):
+    asyncio.run(run_pipeline_async(salary_range, max_con, n_workers, stop_event, gui_queue))
 
 
 # ══════════════════════════════════════════════════════════
@@ -632,7 +803,8 @@ class CrawlerGUI:
         # ── 기본값 ───────────────────────────────────────
         self.salary_min  = 5
         self.salary_max  = 50
-        self.max_con     = 50
+        self.max_con     = 100
+        self.n_workers   = 2
 
         # ── 시작 모드 결정 ────────────────────────────────
         if os.path.exists(CHECKPOINT_JSON) or os.path.exists(DETAILS_CSV):
@@ -705,7 +877,7 @@ class CrawlerGUI:
 
         t = threading.Thread(
             target=run_pipeline,
-            args=(salary_range, self.max_con,
+            args=(salary_range, self.max_con, self.n_workers,
                   self.stop_event, self._gui_queue),
             daemon=True,
         )
@@ -765,14 +937,15 @@ class CrawlerGUI:
     def _show_settings(self) -> None:
         popup = tk.Toplevel(self.root)
         popup.title("설정")
-        popup.geometry("280x180")
+        popup.geometry("280x220")
         popup.transient(self.root)
         popup.grab_set()
 
         fields = [
-            ("급여 최소:", "salary_min",  self.salary_min),
-            ("급여 최대:", "salary_max",  self.salary_max),
-            ("max_con:",   "max_con",     self.max_con),
+            ("급여 최소:",   "salary_min",  self.salary_min),
+            ("급여 최대:",   "salary_max",  self.salary_max),
+            ("max_con:",    "max_con",     self.max_con),
+            ("프로세스 수:", "n_workers",   self.n_workers),
         ]
         entries: dict = {}
         for i, (lbl, key, default) in enumerate(fields):
@@ -787,6 +960,7 @@ class CrawlerGUI:
                 self.salary_min = int(entries["salary_min"].get())
                 self.salary_max = int(entries["salary_max"].get())
                 self.max_con    = int(entries["max_con"].get())
+                self.n_workers  = int(entries["n_workers"].get())
             except ValueError:
                 messagebox.showerror("오류", "모든 값은 숫자여야 합니다.")
                 return

@@ -35,7 +35,7 @@ async def main():
 
     print("Phase 2: 수집 시작")
     t1 = time.time()
-    await v2.run_phase2(ovr_results, salary_range, max_con=50,
+    await v2.run_phase2(ovr_results, salary_range, max_con=100,
                         n_workers=2,
                         stop_event=stop_event,
                         progress_cb=lambda d,t: None)
