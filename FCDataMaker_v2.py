@@ -425,100 +425,79 @@ async def run_phase2(
     progress_cb,
 ) -> None:
     """
-    Producer-Consumer 스트리밍 파이프라인:
-      job_producer → code_fetcher (N) → detail_fetcher (M) → details.csv
+    단일 세션 스트리밍 파이프라인.
+    - done_codes:   이미 details.csv에 저장된 코드
+    - queued_codes: 이미 detail 요청을 보낸 코드 (done_codes의 상위 집합)
+                    → 여러 job이 같은 코드를 발견해도 중복 요청 방지
+    - 단일 ClientSession + TCPConnector 로 연결 풀 공유 (속도 개선)
+    - create_task 로 코드 발견 즉시 detail 요청 시작 (스트리밍)
     """
-    done_codes: set[str] = load_done_codes()
-    all_jobs = generate_all_jobs(ovr_results, salary_range)
+    done_codes:   set[str] = load_done_codes()
+    queued_codes: set[str] = set(done_codes)   # 중복 방지용 — 요청 보낸 코드 추적
+    q_lock   = asyncio.Lock()   # queued_codes 보호
+    buf_lock = asyncio.Lock()   # buffer + done_codes 보호
+    buffer:   list = []
+    jobs_done = [0]
+
+    all_jobs   = generate_all_jobs(ovr_results, salary_range)
+    total_jobs = len(all_jobs)
 
     if not all_jobs:
         print("⚠️ 수집할 job이 없습니다.")
         return
 
-    total_jobs   = len(all_jobs)
-    total_est    = total_jobs  # 진행률 분모 (job 단위)
-    jobs_done    = 0
-
-    N_CODE   = max(2, max_con // 4)
-    N_DETAIL = max_con
-
-    code_queue:   asyncio.Queue = asyncio.Queue(maxsize=600)
-    detail_queue: asyncio.Queue = asyncio.Queue(maxsize=400)
-    code_done_q:  asyncio.Queue = asyncio.Queue()
-
-    buffer: list  = []
-    buf_lock = asyncio.Lock()
-
     print(f"=== [Phase 2] 스트리밍 수집 시작 ===")
-    print(f"  job 수: {total_jobs}, 코드워커: {N_CODE}, 상세워커: {N_DETAIL}")
-    print(f"  이미 완료된 선수: {len(done_codes)}명 스킵")
+    print(f"  job 수: {total_jobs}, max_con: {max_con}")
+    print(f"  이미 완료: {len(done_codes)}명 스킵")
 
-    async def job_producer() -> None:
-        for job in all_jobs:
+    connector = aiohttp.TCPConnector(limit=max_con * 2)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        code_sem   = asyncio.Semaphore(max_con)
+        detail_sem = asyncio.Semaphore(max_con)
+        pending_details: set = set()
+
+        async def fetch_and_save(code: str) -> None:
+            detail = await fetch_detail_for_code(session, detail_sem, code)
+            if detail:
+                async with buf_lock:
+                    buffer.append(detail)
+                    done_codes.add(code)
+                    if len(buffer) >= 50:
+                        flush_buffer(buffer[:])
+                        buffer.clear()
+                        print(f"💾 {len(done_codes)}명 저장")
+
+        async def process_job(job: dict) -> None:
             if stop_event.is_set():
-                break
-            await code_queue.put(job)
-        for _ in range(N_CODE):
-            await code_queue.put(None)
+                return
+            codes = await fetch_codes_for_job(session, code_sem, job)
 
-    async def code_fetcher() -> None:
-        nonlocal jobs_done
-        async with aiohttp.ClientSession() as session:
-            sem = asyncio.Semaphore(max(1, max_con // N_CODE))
-            while True:
-                job = await code_queue.get()
-                if job is None:
-                    code_queue.task_done()
-                    break
-                if not stop_event.is_set():
-                    codes = await fetch_codes_for_job(session, sem, job)
-                    for c in codes:
-                        if c not in done_codes:
-                            await detail_queue.put(c)
-                code_queue.task_done()
-                jobs_done += 1
-                progress_cb(jobs_done, total_est)
-        await code_done_q.put(1)
+            # queued_codes 에 없는 코드만 추출 (중복 방지)
+            async with q_lock:
+                new_codes = [c for c in codes if c not in queued_codes]
+                queued_codes.update(new_codes)
 
-    async def detail_coordinator() -> None:
-        for _ in range(N_CODE):
-            await code_done_q.get()
-        for _ in range(N_DETAIL):
-            await detail_queue.put(None)
+            for code in new_codes:
+                t = asyncio.create_task(fetch_and_save(code))
+                pending_details.add(t)
+                t.add_done_callback(pending_details.discard)
 
-    async def detail_fetcher() -> None:
-        async with aiohttp.ClientSession() as session:
-            sem = asyncio.Semaphore(max(1, max_con // N_DETAIL))
-            while True:
-                code = await detail_queue.get()
-                if code is None:
-                    detail_queue.task_done()
-                    break
-                if stop_event.is_set():
-                    detail_queue.task_done()
-                    continue
-                detail = await fetch_detail_for_code(session, sem, code)
-                if detail:
-                    async with buf_lock:
-                        buffer.append(detail)
-                        done_codes.add(code)
-                        if len(buffer) >= 50:
-                            flush_buffer(buffer[:])
-                            buffer.clear()
-                            print(f"💾 {len(done_codes)}명 저장 완료")
-                detail_queue.task_done()
+            jobs_done[0] += 1
+            if jobs_done[0] % 20 == 0 or jobs_done[0] == total_jobs:
+                print(f"  job {jobs_done[0]}/{total_jobs} | 수집: {len(done_codes)}명")
+            progress_cb(jobs_done[0], total_jobs)
 
-    await asyncio.gather(
-        job_producer(),
-        *[code_fetcher()   for _ in range(N_CODE)],
-        detail_coordinator(),
-        *[detail_fetcher() for _ in range(N_DETAIL)],
-    )
+        # 모든 job을 동시에 처리 (code_sem 이 동시성 제한)
+        await asyncio.gather(*[process_job(j) for j in all_jobs])
 
-    async with buf_lock:
-        if buffer:
-            flush_buffer(buffer[:])
-            buffer.clear()
+        # 남은 detail 태스크 완료 대기
+        if pending_details:
+            await asyncio.gather(*list(pending_details), return_exceptions=True)
+
+        async with buf_lock:
+            if buffer:
+                flush_buffer(buffer[:])
+                buffer.clear()
 
     print(f"✅ Phase 2 완료 — 총 {len(done_codes)}명 수집")
 
