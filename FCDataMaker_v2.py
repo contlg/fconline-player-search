@@ -450,10 +450,12 @@ async def run_phase2(
     print(f"  job 수: {total_jobs}, max_con: {max_con}")
     print(f"  이미 완료: {len(done_codes)}명 스킵")
 
-    connector = aiohttp.TCPConnector(limit=max_con * 2)
+    code_con   = max(5, max_con // 5)   # 코드 목록 수집 — 적은 동시성으로 충분
+    detail_con = max_con                # 디테일 수집 — 가능한 최대 동시성
+    connector = aiohttp.TCPConnector(limit=detail_con + code_con)
     async with aiohttp.ClientSession(connector=connector) as session:
-        code_sem   = asyncio.Semaphore(max_con)
-        detail_sem = asyncio.Semaphore(max_con)
+        code_sem   = asyncio.Semaphore(code_con)
+        detail_sem = asyncio.Semaphore(detail_con)
         pending_details: set = set()
 
         async def fetch_and_save(code: str) -> None:
@@ -638,7 +640,7 @@ class CrawlerGUI:
         # ── 기본값 ───────────────────────────────────────
         self.salary_min  = 5
         self.salary_max  = 50
-        self.max_con     = 20
+        self.max_con     = 50
 
         # ── 시작 모드 결정 ────────────────────────────────
         if os.path.exists(CHECKPOINT_JSON) or os.path.exists(DETAILS_CSV):
