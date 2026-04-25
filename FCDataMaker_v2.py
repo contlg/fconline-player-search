@@ -112,7 +112,7 @@ async def fetch_with_retry(
 def parse_player_html(spid: str, html: str) -> dict | None:
     """BeautifulSoup으로 PlayerAbility HTML 파싱. 순수 함수 (I/O 없음)."""
     try:
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, "lxml")
 
         tdef = soup.select_one("div.tdefault")
         team_colors = []
@@ -241,7 +241,7 @@ async def fetch_codes_for_job(
         html = await fetch_with_retry(session, URL_LIST, pld)
         if html is None:
             return []
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, "lxml")
         codes = [
             m.group(1)
             for tr in soup.select("div.tr")
@@ -269,7 +269,7 @@ async def _get_ovr_info(
         html = await fetch_with_retry(session, URL_LIST, pld)
     if html is None:
         return 0, None, None
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     ovrs = []
     for tr in soup.select("div.tr"):
         m = re.search(r"\.val\('([0-9]+)'\)", tr.get("onclick", ""))
