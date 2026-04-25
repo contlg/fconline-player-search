@@ -417,28 +417,94 @@ def finalize() -> None:
     print(f"✅ 최종 파일 저장: {FINAL_CSV} ({len(final_df)}명)")
 
 
+def _flush_to_path(buf: list, path: str) -> None:
+    """워커 전용 임시 CSV에 버퍼 추가 저장."""
+    if not buf:
+        return
+    df_new = pd.DataFrame(buf)
+    if os.path.exists(path):
+        df_new.to_csv(path, mode="a", index=False, header=False, encoding="utf-8-sig")
+    else:
+        df_new.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+async def _phase2_worker_async(
+    job_chunk: list,
+    tmp_csv: str,
+    worker_id: int,
+    max_con: int,
+    done_codes: set,
+    stop_event: threading.Event,
+    shared_done: list,
+    done_lock: threading.Lock,
+) -> None:
+    """단일 워커: 독립 이벤트루프 + 독립 세션으로 job_chunk 처리."""
+    queued_codes: set[str] = set(done_codes)
+    q_lock   = asyncio.Lock()
+    buf_lock = asyncio.Lock()
+    buffer:  list = []
+
+    code_con  = max(5, max_con // 5)
+    detail_con = max_con
+
+    async with aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(limit=detail_con + code_con)
+    ) as session:
+        code_sem   = asyncio.Semaphore(code_con)
+        detail_sem = asyncio.Semaphore(detail_con)
+        pending: set = set()
+
+        async def fetch_and_save(code: str) -> None:
+            detail = await fetch_detail_for_code(session, detail_sem, code)
+            if detail:
+                async with buf_lock:
+                    buffer.append(detail)
+                    if len(buffer) >= 50:
+                        _flush_to_path(buffer[:], tmp_csv)
+                        buffer.clear()
+                        with done_lock:
+                            shared_done[0] += 50
+
+        async def process_job(job: dict) -> None:
+            if stop_event.is_set():
+                return
+            codes = await fetch_codes_for_job(session, code_sem, job)
+            async with q_lock:
+                new_codes = [c for c in codes if c not in queued_codes]
+                queued_codes.update(new_codes)
+            for code in new_codes:
+                t = asyncio.create_task(fetch_and_save(code))
+                pending.add(t)
+                t.add_done_callback(pending.discard)
+
+        await asyncio.gather(*[process_job(j) for j in job_chunk])
+        if pending:
+            await asyncio.gather(*list(pending), return_exceptions=True)
+        async with buf_lock:
+            if buffer:
+                _flush_to_path(buffer[:], tmp_csv)
+                with done_lock:
+                    shared_done[0] += len(buffer)
+
+    print(f"  [W{worker_id}] 완료")
+
+
 async def run_phase2(
     ovr_results: dict,
     salary_range: range,
     max_con: int,
     stop_event: threading.Event,
     progress_cb,
+    n_workers: int = 4,
 ) -> None:
     """
-    단일 세션 스트리밍 파이프라인.
-    - done_codes:   이미 details.csv에 저장된 코드
-    - queued_codes: 이미 detail 요청을 보낸 코드 (done_codes의 상위 집합)
-                    → 여러 job이 같은 코드를 발견해도 중복 요청 방지
-    - 단일 ClientSession + TCPConnector 로 연결 풀 공유 (속도 개선)
-    - create_task 로 코드 발견 즉시 detail 요청 시작 (스트리밍)
+    멀티스레드 스트리밍 파이프라인.
+    - n_workers 개 스레드, 각자 독립 asyncio 루프 + aiohttp 세션
+    - job을 라운드로빈으로 분배 → salary 5(고밀도)가 모든 워커에 균등 분산
+    - 각 워커는 tmp CSV에 저장, 완료 후 병합 + drop_duplicates
+    - 누락 방지: done_codes(기존 수집분) + 워커 내 queued_codes(중복요청 방지)
     """
-    done_codes:   set[str] = load_done_codes()
-    queued_codes: set[str] = set(done_codes)   # 중복 방지용 — 요청 보낸 코드 추적
-    q_lock   = asyncio.Lock()   # queued_codes 보호
-    buf_lock = asyncio.Lock()   # buffer + done_codes 보호
-    buffer:   list = []
-    jobs_done = [0]
-
+    done_codes = load_done_codes()
     all_jobs   = generate_all_jobs(ovr_results, salary_range)
     total_jobs = len(all_jobs)
 
@@ -446,62 +512,77 @@ async def run_phase2(
         print("⚠️ 수집할 job이 없습니다.")
         return
 
-    print(f"=== [Phase 2] 스트리밍 수집 시작 ===")
-    print(f"  job 수: {total_jobs}, max_con: {max_con}")
+    print(f"=== [Phase 2] 병렬 스트리밍 수집 ({n_workers}워커) ===")
+    print(f"  job 수: {total_jobs}, max_con/워커: {max_con}, 총 동시: {max_con * n_workers}")
     print(f"  이미 완료: {len(done_codes)}명 스킵")
 
-    code_con   = max(5, max_con // 5)   # 코드 목록 수집 — 적은 동시성으로 충분
-    detail_con = max_con                # 디테일 수집 — 가능한 최대 동시성
-    connector = aiohttp.TCPConnector(limit=detail_con + code_con)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        code_sem   = asyncio.Semaphore(code_con)
-        detail_sem = asyncio.Semaphore(detail_con)
-        pending_details: set = set()
+    # 라운드로빈 분배 — salary 5(고밀도 job) 를 모든 워커에 균등 분산
+    chunks: list[list] = [[] for _ in range(n_workers)]
+    for i, job in enumerate(all_jobs):
+        chunks[i % n_workers].append(job)
 
-        async def fetch_and_save(code: str) -> None:
-            detail = await fetch_detail_for_code(session, detail_sem, code)
-            if detail:
-                async with buf_lock:
-                    buffer.append(detail)
-                    done_codes.add(code)
-                    if len(buffer) >= 50:
-                        flush_buffer(buffer[:])
-                        buffer.clear()
-                        print(f"💾 {len(done_codes)}명 저장")
+    tmp_csvs    = [DETAILS_CSV + f".worker{i}.tmp" for i in range(n_workers)]
+    shared_done = [0]
+    done_lock   = threading.Lock()
 
-        async def process_job(job: dict) -> None:
-            if stop_event.is_set():
-                return
-            codes = await fetch_codes_for_job(session, code_sem, job)
+    def run_worker(chunk: list, tmp_csv: str, worker_id: int) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_phase2_worker_async(
+                chunk, tmp_csv, worker_id, max_con,
+                done_codes, stop_event, shared_done, done_lock,
+            ))
+        finally:
+            loop.close()
 
-            # queued_codes 에 없는 코드만 추출 (중복 방지)
-            async with q_lock:
-                new_codes = [c for c in codes if c not in queued_codes]
-                queued_codes.update(new_codes)
+    threads = [
+        threading.Thread(
+            target=run_worker,
+            args=(chunks[i], tmp_csvs[i], i),
+            daemon=True,
+        )
+        for i in range(n_workers)
+    ]
 
-            for code in new_codes:
-                t = asyncio.create_task(fetch_and_save(code))
-                pending_details.add(t)
-                t.add_done_callback(pending_details.discard)
+    for t in threads:
+        t.start()
+    print(f"  {n_workers}개 워커 스레드 시작")
 
-            jobs_done[0] += 1
-            if jobs_done[0] % 20 == 0 or jobs_done[0] == total_jobs:
-                print(f"  job {jobs_done[0]}/{total_jobs} | 수집: {len(done_codes)}명")
-            progress_cb(jobs_done[0], total_jobs)
+    # 비동기적으로 완료 대기 (이벤트루프 블록 방지)
+    while any(t.is_alive() for t in threads):
+        progress_cb(shared_done[0], total_jobs)
+        await asyncio.sleep(1.0)
 
-        # 모든 job을 동시에 처리 (code_sem 이 동시성 제한)
-        await asyncio.gather(*[process_job(j) for j in all_jobs])
+    for t in threads:
+        t.join(timeout=10)
 
-        # 남은 detail 태스크 완료 대기
-        if pending_details:
-            await asyncio.gather(*list(pending_details), return_exceptions=True)
+    # 기존 데이터 + 각 워커 tmp CSV 병합
+    all_dfs: list = []
+    if os.path.exists(DETAILS_CSV):
+        try:
+            all_dfs.append(pd.read_csv(DETAILS_CSV, on_bad_lines="skip"))
+        except Exception:
+            pass
 
-        async with buf_lock:
-            if buffer:
-                flush_buffer(buffer[:])
-                buffer.clear()
+    for tmp_csv in tmp_csvs:
+        if os.path.exists(tmp_csv):
+            try:
+                df = pd.read_csv(tmp_csv, on_bad_lines="skip")
+                if not df.empty:
+                    all_dfs.append(df)
+            except Exception as e:
+                print(f"⚠️ 워커 CSV 읽기 실패: {e}")
+            finally:
+                if os.path.exists(tmp_csv):
+                    os.remove(tmp_csv)
 
-    print(f"✅ Phase 2 완료 — 총 {len(done_codes)}명 수집")
+    if all_dfs:
+        merged = pd.concat(all_dfs, ignore_index=True).drop_duplicates(subset=["player_code"])
+        atomic_write_csv(merged, DETAILS_CSV, index=False, encoding="utf-8-sig")
+        print(f"✅ Phase 2 완료 — 총 {len(merged)}명 수집")
+    else:
+        print("⚠️ 수집된 데이터 없음")
 
 
 async def run_pipeline_async(
